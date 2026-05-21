@@ -1,0 +1,14 @@
+# filing_receipt_review — Python dependencies
+#
+# Install with:  pip install -r requirements.txt --break-system-packages
+
+# Required — XFA stream extraction and basic PDF reading
+PyPDF2>=3.0
+
+# Required — better text extraction from the filing receipt PDF
+# (preserves paragraph layout so section-heading regexes find what they expect)
+pdfplumber>=0.11
+
+# Required — render image-only filing receipt PDFs to PNG images when text
+# extraction yields nothing (bundles its own PDF renderer; no poppler needed)
+pypdfium2>=4.0
