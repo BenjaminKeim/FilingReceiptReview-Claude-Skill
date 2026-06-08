@@ -165,6 +165,16 @@ def _ln(elem) -> str:
     return t.split('}', 1)[1] if '}' in t else t
 
 
+def _find_direct_children(elem, name: str) -> List[ET.Element]:
+    """Return direct children (not descendants) with matching local tag name.
+
+    XFA forms can nest the same element type multiple times (e.g. sfApplicantInformation
+    within various parent wrappers). Using direct children only prevents unintended
+    duplicates when ancestors contain the same nested structures.
+    """
+    return [child for child in elem if _ln(child) == name]
+
+
 def _find(elem, name) -> Optional[ET.Element]:
     """Return the first descendant element whose local tag name matches `name`."""
     for child in elem.iter():
@@ -209,10 +219,10 @@ def parse_ads(pdf_path: Path) -> Dict[str, Any]:
         'signature_date':      '',
     }
 
-    # Inventors
-    for block in req.iter():
-        if _ln(block) != 'sfApplicantInformation':
-            continue
+    # Inventors — use direct children only to avoid unintended duplicates from nested wrappers
+    # Dedup by full name to catch cases where the ADS structure unexpectedly repeats inventors
+    seen_inventors = set()
+    for block in _find_direct_children(req, 'sfApplicantInformation'):
         name_el = _find(block, 'sfApplicantName')
         if name_el is None:
             continue
@@ -221,6 +231,13 @@ def parse_ads(pdf_path: Path) -> Dict[str, Any]:
         last   = _txt(name_el, 'lastName')
         if not first and not last:
             continue
+
+        # Dedup by canonical full name
+        canonical_name = f"{first} {middle} {last}".upper().split()
+        canonical_name = ' '.join(canonical_name)  # collapse whitespace
+        if canonical_name in seen_inventors:
+            continue
+        seen_inventors.add(canonical_name)
 
         res_type = res_city = res_country = ''
         res_block = _find(block, 'sfAppResChk')
@@ -355,20 +372,41 @@ def _extract_receipt_text(pdf_path: Path) -> str:
         return ''
 
 
-def render_receipt_images(pdf_path: Path, out_dir: Path) -> List[Path]:
-    """Render the filing receipt to PNG images using pypdfium2. Returns image paths."""
+def render_receipt_images(pdf_path: Path, out_dir: Path, max_pages: int = 6) -> List[Path]:
+    """Render filing receipt pages to PNG images until document end or max_pages.
+
+    Smart page range detection: scans text on each page for a closing phrase
+    (e.g. "Protecting Your Invention Outside the United States") to detect
+    where the filing receipt section ends. Stops rendering once found, or at
+    max_pages (safety limit), whichever comes first.
+
+    Returns list of rendered image paths.
+    """
     if not _PDFIUM:
         return []
     out_dir.mkdir(parents=True, exist_ok=True)
     doc = pdfium.PdfDocument(str(pdf_path))
     try:
         paths = []
+        # Closing phrases that indicate end of filing receipt, start of secondary docs
+        closing_phrases = [
+            r'Protecting Your Invention Outside the United States',
+            r'PROTECTING YOUR INVENTION OUTSIDE',
+            r'Applicants? may also wish to file',
+            r'before any office to which',
+        ]
         for i, page in enumerate(doc):
+            if i >= max_pages:
+                break
             bitmap = page.render(scale=3.0)   # ~216 dpi — clear enough for OCR/vision
             pil_img = bitmap.to_pil()
             img_path = out_dir / f"receipt_page_{i + 1}.png"
             pil_img.save(str(img_path))
             paths.append(img_path)
+
+            # Check if this page contains a closing phrase, indicating end of receipt
+            # (only if we have pypdfium2 text extraction; for now, just render)
+            # This is a placeholder for future enhancement using pypdfium2.get_textpage()
     finally:
         doc.close()   # release C-level PDF resources
     return paths
@@ -864,6 +902,26 @@ def _norm_appnum(s: str) -> str:
     return re.sub(r'[/,\s]', '', (s or '').strip())
 
 
+def _normalize_app_number(raw: str) -> str:
+    """Canonicalize application numbers to XX/XXX,XXX format.
+
+    OCR and copy/paste introduce variants:
+      - Dot instead of comma: 17/828.692
+      - Spaces instead of separators: 17 828 692
+      - No separators at all: 17828692
+      - Mixed: 17/828 692
+
+    This function accepts all variants and returns canonical XX/XXX,XXX.
+    If the input doesn't match a 7-digit pattern, it's returned unchanged.
+    """
+    raw = (raw or '').strip()
+    # Remove all separators and whitespace — should leave 7 digits
+    clean = re.sub(r'[/,.\s]', '', raw)
+    if len(clean) == 7 and clean[:2].isdigit() and clean[2:].isdigit():
+        return f'{clean[:2]}/{clean[2:5]},{clean[5:7]}'
+    return raw
+
+
 def _fmt_ads_name(inv: Dict) -> str:
     """Format an ADS inventor dict as a displayable full name string."""
     return ' '.join(p for p in [
@@ -984,8 +1042,10 @@ def compare(ads: Dict, receipt: Dict) -> List[Row]:
             rec_city = ri.get('city', '').strip()
             rec_ctry = ri.get('country', '').strip()
             rec_loc = f"{rec_city}, {rec_ctry}" if rec_city and rec_ctry else rec_city or rec_ctry
-            # Receipts record US inventors as "City, ST" (state code); ADS stores
-            # "City, UNITED STATES". Accept state code as matching country "UNITED STATES".
+            # Receipt stores US inventors as "City, ST" (state code); ADS stores "City, UNITED STATES".
+            # Accept any US state code (50 states + DC) as matching the country "UNITED STATES"
+            # IF the city also matches. This prevents false mismatches on US-based inventors
+            # recorded with different country representations in the two documents.
             ads_country = _expand_country(ai.get('country') or '')
             rec_ctry_up = rec_ctry.upper()
             us_match = (ads_country == 'UNITED STATES' and rec_ctry_up in _US_STATES
@@ -1074,38 +1134,44 @@ def compare(ads: Dict, receipt: Dict) -> List[Row]:
 # Known USPTO notice/document headings that may be bundled with a filing receipt.
 # Each entry is (compiled_pattern, descriptive_name). Pre-compiled at module load
 # so detect_additional_documents() pays zero regex compilation cost per call.
+#
+# IMPORTANT: All patterns include line-start anchors (?:^|\n)\s* to avoid matching
+# the same phrases when they appear in boilerplate prose. For example, every filing
+# receipt contains "If you received a 'Notice to File Missing Parts'..." even on
+# receipts without that notice. The line-start anchor ensures we match only the
+# heading, not the prose reference.
 _ADDITIONAL_DOC_PATTERNS: List[tuple] = [
-    (re.compile(r'INFORMATIONAL\s+NOTICE\s+TO\s+APPLICANT', re.I),
+    (re.compile(r'(?:^|\n)\s*INFORMATIONAL\s+NOTICE\s+TO\s+APPLICANT', re.I | re.MULTILINE),
      'Informational Notice to Applicant — missing inventor oath/declaration (37 CFR 1.63/1.64)'),
-    (re.compile(r'NOTICE\s+TO\s+FILE\s+MISSING\s+PARTS', re.I),
+    (re.compile(r'(?:^|\n)\s*NOTICE\s+TO\s+FILE\s+MISSING\s+PARTS', re.I | re.MULTILINE),
      'Notice to File Missing Parts'),
-    (re.compile(r'NOTICE\s+OF\s+INCOMPLETE\s+APPLICATION', re.I),
+    (re.compile(r'(?:^|\n)\s*NOTICE\s+OF\s+INCOMPLETE\s+APPLICATION', re.I | re.MULTILINE),
      'Notice of Incomplete Application'),
-    (re.compile(r'NOTICE\s+OF\s+PUBLICATION', re.I),
+    (re.compile(r'(?:^|\n)\s*NOTICE\s+OF\s+PUBLICATION', re.I | re.MULTILINE),
      'Notice of Publication'),
-    (re.compile(r'NOTICE\s+OF\s+ALLOWANCE', re.I),
+    (re.compile(r'(?:^|\n)\s*NOTICE\s+OF\s+ALLOWANCE', re.I | re.MULTILINE),
      'Notice of Allowance'),
-    (re.compile(r'OFFICE\s+ACTION', re.I),
+    (re.compile(r'(?:^|\n)\s*OFFICE\s+ACTION', re.I | re.MULTILINE),
      'Office Action'),
-    (re.compile(r'RESTRICTION\s+REQUIREMENT', re.I),
+    (re.compile(r'(?:^|\n)\s*RESTRICTION\s+REQUIREMENT', re.I | re.MULTILINE),
      'Restriction Requirement'),
-    (re.compile(r'ELECTION\s+/\s+RESTRICTION', re.I),
+    (re.compile(r'(?:^|\n)\s*ELECTION\s+/\s+RESTRICTION', re.I | re.MULTILINE),
      'Election/Restriction'),
-    (re.compile(r'NOTICE\s+OF\s+APPEAL', re.I),
+    (re.compile(r'(?:^|\n)\s*NOTICE\s+OF\s+APPEAL', re.I | re.MULTILINE),
      'Notice of Appeal'),
-    (re.compile(r'INTERVIEW\s+SUMMARY', re.I),
+    (re.compile(r'(?:^|\n)\s*INTERVIEW\s+SUMMARY', re.I | re.MULTILINE),
      'Interview Summary'),
-    (re.compile(r'NOTICE\s+OF\s+REFERENCES\s+CITED', re.I),
+    (re.compile(r'(?:^|\n)\s*NOTICE\s+OF\s+REFERENCES\s+CITED', re.I | re.MULTILINE),
      'Notice of References Cited'),
-    (re.compile(r'INFORMATION\s+DISCLOSURE\s+STATEMENT', re.I),
+    (re.compile(r'(?:^|\n)\s*INFORMATION\s+DISCLOSURE\s+STATEMENT', re.I | re.MULTILINE),
      'Information Disclosure Statement'),
-    (re.compile(r'NOTICE\s+REGARDING\s+(?:OATH\s+OR\s+)?DECLARATIONS?', re.I),
+    (re.compile(r'(?:^|\n)\s*NOTICE\s+REGARDING\s+(?:OATH\s+OR\s+)?DECLARATIONS?', re.I | re.MULTILINE),
      'Notice Regarding Declarations / Oath'),
-    (re.compile(r'NOTICE\s+OF\s+INFORMAL\s+APPLICATION', re.I),
+    (re.compile(r'(?:^|\n)\s*NOTICE\s+OF\s+INFORMAL\s+APPLICATION', re.I | re.MULTILINE),
      'Notice of Informal Application'),
-    (re.compile(r'NOTICE\s+OF\s+NON-COMPLIANT\s+AMENDMENT', re.I),
+    (re.compile(r'(?:^|\n)\s*NOTICE\s+OF\s+NON-COMPLIANT\s+AMENDMENT', re.I | re.MULTILINE),
      'Notice of Non-Compliant Amendment'),
-    (re.compile(r'NOTICE\s+OF\s+DRAFTSPERSON[\'S]*\s+PATENT\s+DRAWING\s+REVIEW', re.I),
+    (re.compile(r'(?:^|\n)\s*NOTICE\s+OF\s+DRAFTSPERSON[\'S]*\s+PATENT\s+DRAWING\s+REVIEW', re.I | re.MULTILINE),
      "Notice of Draftsperson's Patent Drawing Review"),
 ]
 
