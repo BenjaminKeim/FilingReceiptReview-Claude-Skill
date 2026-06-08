@@ -10,23 +10,25 @@ This skill automates that review by:
 
 1. Extracting all structured data from the ADS using its embedded **XFA datasets stream** (no Adobe Acrobat required)
 2. Extracting data from the Filing Receipt — handles both **text-based** and **image-only (scanned)** receipts
-3. Producing a **Markdown comparison table** with OK/DISCREPANCY status for every field
+3. Producing a **Markdown comparison table** with OK/DISCREPANCY/CRITICAL DISCREPANCY status for every field
 
 ### Fields Compared
 
 | Field | Notes |
 |---|---|
 | Title | Case-insensitive exact match |
-| Docket Number | Exact match |
+| Docket Number | Exact match; handles `ATTY DOCKET NO`, `Attorney Docket Number`, and `Docket Number` heading variants |
 | Applicant / Assignee | Org name containment match (receipt appends city/state) |
 | Customer Number | Correspondence customer number |
 | ADS Signature Date vs. Filing Date | Should match; mismatch may indicate a re-dating issue |
 | Inventor Count | Total inventors |
-| Inventor N — Name | ADS first + middle + last vs. receipt full name |
+| Inventor N — Name | Levenshtein edit-distance comparison; 1–2 char differences flagged with OCR-artifact note |
 | Inventor N — City, Country | ADS ISO country code expanded to full name before comparing |
-| Domestic Benefit Claim | None / application number(s) |
-| Foreign Priority Claim | None / application number(s) + country |
-| Non-Publication Request | Yes/No |
+| Domestic Benefit Claim | None / application number(s) — **Critical** |
+| Foreign Priority Claim | None / application number(s) + country — **Critical** |
+| Non-Publication Request | Yes/No (only compared if receipt explicitly records it) |
+
+Critical fields (benefit/priority) are flagged as **[CRITICAL DISCREPANCY]** and grouped separately in the output with MPEP 503 remediation instructions.
 
 ## Requirements
 
@@ -42,8 +44,15 @@ pip install PyPDF2 pdfplumber pypdfium2
 | Package | Purpose |
 |---|---|
 | `PyPDF2` | XFA stream extraction from the ADS |
-| `pdfplumber` | Text extraction from text-based Filing Receipts |
-| `pypdfium2` | Renders image-only Filing Receipts to PNG for visual review |
+| `pdfplumber` | Text extraction from text-based Filing Receipts (handles column table layout) |
+| `pypdfium2` | Renders image-only Filing Receipts to PNG for OCR or visual review |
+
+Optional (improves image-only receipt handling significantly):
+
+```bash
+pip install pytesseract
+# Windows: also install Tesseract-OCR from https://github.com/UB-Mannheim/tesseract/wiki
+```
 
 ## Installation
 
@@ -95,13 +104,18 @@ USPTO Filing Receipts are frequently issued as scanned image PDFs with no extrac
 
 1. Extracts and prints all ADS data (always works — reads the XFA stream directly)
 2. Renders the receipt pages to PNG images at high resolution using `pypdfium2` (no Poppler or Ghostscript required)
-3. Exits with code 2, instructing Claude Code to read the rendered images with its vision capability and complete the comparison
+3. **Attempts Tesseract OCR** on the rendered images; if successful, runs the full automated comparison
+4. If Tesseract is unavailable or yields insufficient text, exits with code 2 — Claude Code reads the rendered images with its vision capability and completes the comparison manually
 
-No manual intervention needed — Claude Code handles the vision step automatically per the `SKILL.md` workflow.
+No manual intervention needed in either case — Claude Code handles the OCR/vision step automatically per the `SKILL.md` workflow.
 
 ## Technical Background: XFA Dynamic PDFs
 
-USPTO web-fillable forms — including the ADS (PTO/AIA/14), declarations (PTO/AIA/01, /02), and the Power of Attorney (PTO/AIA/82) — are **XFA dynamic PDFs**. Standard PDF text extractors return only a "Please wait..." placeholder. You must read the embedded XFA datasets XML stream directly:
+USPTO web-fillable forms — including the ADS (PTO/AIA/14), declarations (PTO/AIA/01, /02), and the Power of Attorney (PTO/AIA/82) — are **XFA dynamic PDFs**. Standard PDF text extractors return only a "Please wait..." placeholder. You must read the embedded XFA datasets XML stream directly.
+
+### The Two-Datasets Problem
+
+A filled ADS contains **two** `xfa:datasets` streams: an empty skeleton written when the form was first loaded, and the actual submitted data appended as an incremental PDF update. The filled data stream is always substantially larger. Extracting the first match gives you the empty template; you must collect all matches and take the largest:
 
 ```python
 import PyPDF2
@@ -109,23 +123,33 @@ import xml.etree.ElementTree as ET
 
 reader = PyPDF2.PdfReader(ads_path)
 xfa    = reader.trailer['/Root']['/AcroForm']['/XFA']
-items  = list(xfa)                           # array of [name, stream, name, stream, ...]
+items  = list(xfa)   # alternating [name, stream_ref, name, stream_ref, ...]
+
+# Collect ALL 'datasets' entries — the filled form is in an incremental update
+# appended after the blank template. Return the largest (the filled data).
+candidates = []
 for i in range(0, len(items), 2):
-    if str(items[i]) == 'datasets':          # look up by name, not by content scan
-        xml_str = items[i+1].get_data().decode('utf-8', errors='replace')
-        break
+    if str(items[i]) == 'datasets':
+        xml_bytes = items[i + 1].get_object().get_data()
+        candidates.append(xml_bytes.decode('utf-8', errors='replace'))
 
-root = ET.fromstring(xml_str)                # parses directly — no whitespace cleanup needed
+xml_str = max(candidates, key=len) if candidates else None
+root = ET.fromstring(xml_str)
+```
 
-# Strip XML namespace prefixes for easy traversal
-def localname(elem):
-    tag = elem.tag
-    return tag.split('}', 1)[1] if '}' in tag else tag
+If structured XFA navigation yields nothing (e.g. compressed ObjStm/xref-stream PDFs), the script falls back to scanning every FlateDecode stream in the raw file bytes and returning the largest block containing `<xfa:datasets`.
 
-def find_first(elem, name):
-    for child in elem.iter():
-        if localname(child) == name:
-            return child
+### Traversal Helper
+
+All ADS field lookups use local tag names (ignoring XML namespace prefixes) to stay robust across namespace variations:
+
+```python
+def find_first(root, name):
+    for elem in root.iter():
+        tag = elem.tag
+        local = tag.split('}', 1)[1] if '}' in tag else tag
+        if local == name:
+            return elem
     return None
 ```
 
@@ -157,6 +181,32 @@ File order doesn't matter — the script auto-detects which is the ADS (XFA form
 - `0` — Comparison table printed to stdout (Markdown)
 - `2` — Image-only receipt; ADS summary + rendered image paths output; vision fallback needed
 - `1` — Fatal error (file not found, wrong file types, etc.)
+
+## Changelog
+
+### v1.3.0 — Code quality, security, and performance
+
+- **Security:** Rendered PNG images of filing receipts (written during the image-only OCR path) now contain a privacy warning in output and are automatically deleted after successful Tesseract OCR. Previously they were left on disk indefinitely.
+- **Security:** Fixed inconsistent error sentinel in ODP API lookup — `error` is now consistently `None` on success, non-empty string on failure.
+- **Performance:** Fixed `pdfplumber` calling `extract_text()` twice per page (once in the `if` condition, once to capture the value). Text extraction now calls it once per page.
+- **Performance:** Document-type detection patterns (`_ADDITIONAL_DOC_PATTERNS`) are now pre-compiled `re.Pattern` objects at module load rather than raw strings re-compiled on every call to `detect_additional_documents()`.
+- **Performance:** Replaced `any([list])` constructs with direct boolean short-circuit expressions throughout `parse_ads()`.
+- **Comments:** Added explanatory comments for non-obvious behaviors: why `pdfplumber` is preferred over `PyPDF2` for receipt text extraction (column table layout), Python `for/else` semantics in the ODP retry loop, and the PII sensitivity of rendered temp images.
+
+### v1.2.0 — Robustness improvements from real-world testing
+
+- **XFA extraction fix (critical):** The script previously returned blank ADS data for any filled ADS form. USPTO ADS forms contain two `xfa:datasets` streams — an empty skeleton and the filled data appended as an incremental PDF update. The script now collects all `datasets` entries and returns the largest, ensuring the filled form data is used. A raw-byte brute-force fallback handles edge-case PDFs where structured XFA navigation misses the filled stream.
+- **Inventor name fuzzy matching:** Name comparison now uses Levenshtein edit distance. Mismatches with an edit distance of 1–2 characters are still flagged as `[DISCREPANCY]` but include an explanatory note: *"could be OCR artifact (e.g. i/l/1 substitution)"*. This is common when filing receipts are scanned — OCR frequently confuses lowercase `i`, `l`, and digit `1`.
+- **Docket number parsing:** Added `Docket Number` / `Docket No.` as a third fallback heading pattern, in addition to the existing `ATTY DOCKET NO` and `Attorney Docket Number` patterns.
+
+### v1.1.0 — Initial public release
+
+- XFA data extraction from ADS (PTO/AIA/14)
+- Text and image-only filing receipt handling
+- Full field comparison: title, docket, applicant, customer number, inventors, priority claims
+- USPTO ODP API integration for priority chain date/patent-number verification
+- Tesseract OCR fallback for image-only receipts
+- Severity tiers: `[DISCREPANCY]` vs `[CRITICAL DISCREPANCY]` for benefit/priority fields
 
 ## License
 
