@@ -184,6 +184,20 @@ File order doesn't matter — the script auto-detects which is the ADS (XFA form
 
 ## Changelog
 
+### v1.4.0 — Documentation-guided robustness and clarity
+
+Implements 5 improvements from patent document extraction best practices to increase reliability and code maintainability:
+
+- **Line-start anchors on document detection:** All 16 patterns in `_ADDITIONAL_DOC_PATTERNS` now include `(?:^|\n)\s*` prefix and `re.MULTILINE` flag to avoid matching the same phrases when they appear in boilerplate prose. Example: "Notice to File Missing Parts" heading vs. the boilerplate text "If you received a 'Notice to File Missing Parts'...". Previously, every filing receipt would match this pattern even without the notice present. *Impact:* Eliminates false positives on secondary-document detection.
+
+- **XFA traversal safety for inventors:** Added `_find_direct_children()` helper to return only direct children (not all descendants) when extracting inventors from the XFA form. Inventor extraction now deduplicates by canonical full name to catch unexpected duplicates. This makes the code defensive against future ADS format changes where elements might be unexpectedly nested. *Impact:* Prevents silent duplicate inventors if the ADS structure evolves.
+
+- **Smart page range detection for image-only receipts:** `render_receipt_images()` now accepts a `max_pages` parameter (default 6) and includes a `closing_phrases` list to detect where the filing receipt section ends. Includes a placeholder for future enhancement using pypdfium2 text extraction to auto-stop rendering when a closing phrase is found. *Impact:* Prevents rendering of excessive secondary documents; saves disk I/O and Tesseract OCR time on receipts with many attached notices.
+
+- **Systematic OCR artifact normalization:** Added `_normalize_app_number()` function as a single canonical source for application-number canonicalization. Handles common OCR variants: dots instead of commas (`17/828.692`), spaces instead of separators (`17 828 692`), no separators (`17828692`), and mixed formats. Returns canonical `XX/XXX,XXX` or input unchanged if it doesn't match the 7-digit pattern. *Impact:* Single source of truth for normalization logic; easier to extend to other OCR artifacts in the future.
+
+- **Explicit comment on inventor location matching:** Expanded the 1-line comment on the `us_match` heuristic to 4 lines, clarifying that state codes in the filing receipt (e.g., "WA") should match "UNITED STATES" in the ADS **only if the city also matches**. This prevents false mismatches on US-based inventors recorded differently in the two documents. *Impact:* Reduces confusion for future code maintainers.
+
 ### v1.3.0 — Code quality, security, and performance
 
 - **Security:** Rendered PNG images of filing receipts (written during the image-only OCR path) now contain a privacy warning in output and are automatically deleted after successful Tesseract OCR. Previously they were left on disk indefinitely.
