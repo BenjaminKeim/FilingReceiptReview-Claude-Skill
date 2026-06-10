@@ -19,6 +19,7 @@ Exit codes:
 import json
 import os
 import re
+import shutil
 import sys
 import tempfile
 import time
@@ -165,16 +166,6 @@ def _ln(elem) -> str:
     return t.split('}', 1)[1] if '}' in t else t
 
 
-def _find_direct_children(elem, name: str) -> List[ET.Element]:
-    """Return direct children (not descendants) with matching local tag name.
-
-    XFA forms can nest the same element type multiple times (e.g. sfApplicantInformation
-    within various parent wrappers). Using direct children only prevents unintended
-    duplicates when ancestors contain the same nested structures.
-    """
-    return [child for child in elem if _ln(child) == name]
-
-
 def _find(elem, name) -> Optional[ET.Element]:
     """Return the first descendant element whose local tag name matches `name`."""
     for child in elem.iter():
@@ -210,19 +201,17 @@ def parse_ads(pdf_path: Path) -> Dict[str, Any]:
         'inventors':           [],
         'assignee_org':        '',
         'customer_number':     '',
-        'small_entity':        None,
-        'application_type':    '',
-        'drawing_sheets':      '',
         'non_publication':     None,
         'domestic_continuity': [],
         'foreign_priority':    [],
         'signature_date':      '',
     }
 
-    # Inventors — use direct children only to avoid unintended duplicates from nested wrappers
-    # Dedup by full name to catch cases where the ADS structure unexpectedly repeats inventors
+    # Inventors — search entire subtree because some ADS versions nest sfApplicantInformation
+    # inside ContentArea* elements rather than placing them as direct children of us-request.
+    # Dedup by full name guards against any duplicates introduced by nested wrappers.
     seen_inventors = set()
-    for block in _find_direct_children(req, 'sfApplicantInformation'):
+    for block in (el for el in req.iter() if _ln(el) == 'sfApplicantInformation'):
         name_el = _find(block, 'sfApplicantName')
         if name_el is None:
             continue
@@ -266,14 +255,6 @@ def parse_ads(pdf_path: Path) -> Dict[str, Any]:
         atty = _find(req, 'sfAttorny')
         if atty is not None:
             data['customer_number'] = _txt(atty, 'customerNumberTxt')
-
-    # App info
-    app_pos = _find(req, 'sfAppPos')
-    if app_pos is not None:
-        small = _txt(app_pos, 'chkSmallEntity')
-        data['small_entity']     = (small == '1') if small in ('0', '1') else None
-        data['application_type'] = _txt(app_pos, 'application_type')
-        data['drawing_sheets']   = _txt(app_pos, 'us-total_number_of_drawing-sheets')
 
     pub = _find(req, 'sfPub')
     if pub is not None:
@@ -375,12 +356,8 @@ def _extract_receipt_text(pdf_path: Path) -> str:
 def render_receipt_images(pdf_path: Path, out_dir: Path, max_pages: int = 6) -> List[Path]:
     """Render filing receipt pages to PNG images until document end or max_pages.
 
-    Smart page range detection: scans text on each page for a closing phrase
-    (e.g. "Protecting Your Invention Outside the United States") to detect
-    where the filing receipt section ends. Stops rendering once found, or at
-    max_pages (safety limit), whichever comes first.
-
-    Returns list of rendered image paths.
+    Boilerplate truncation is handled at the OCR-text level by _truncate_receipt_text,
+    so all pages up to max_pages are rendered here. Returns list of rendered image paths.
     """
     if not _PDFIUM:
         return []
@@ -388,13 +365,6 @@ def render_receipt_images(pdf_path: Path, out_dir: Path, max_pages: int = 6) -> 
     doc = pdfium.PdfDocument(str(pdf_path))
     try:
         paths = []
-        # Closing phrases that indicate end of filing receipt, start of secondary docs
-        closing_phrases = [
-            r'Protecting Your Invention Outside the United States',
-            r'PROTECTING YOUR INVENTION OUTSIDE',
-            r'Applicants? may also wish to file',
-            r'before any office to which',
-        ]
         for i, page in enumerate(doc):
             if i >= max_pages:
                 break
@@ -403,10 +373,6 @@ def render_receipt_images(pdf_path: Path, out_dir: Path, max_pages: int = 6) -> 
             img_path = out_dir / f"receipt_page_{i + 1}.png"
             pil_img.save(str(img_path))
             paths.append(img_path)
-
-            # Check if this page contains a closing phrase, indicating end of receipt
-            # (only if we have pypdfium2 text extraction; for now, just render)
-            # This is a placeholder for future enhancement using pypdfium2.get_textpage()
     finally:
         doc.close()   # release C-level PDF resources
     return paths
@@ -441,6 +407,24 @@ _COUNTRY_MAP = {
 def _expand_country(code_or_name: str) -> str:
     s = code_or_name.strip().upper()
     return _COUNTRY_MAP.get(s, s)
+
+
+# Tokens that cannot be a docket number — grabbed when the "ATTY DOCKET NO" label
+# wraps onto the next line and the parser picks up a column header instead of a value.
+_DOCKET_STOPWORDS = {
+    'TOT', 'TOTAL', 'IND', 'INDEPENDENT', 'CLAIMS', 'FILING',
+    'DATE', 'GRP', 'ART', 'UNIT', 'FIL', 'FEE', 'RECD', 'NUMBER',
+    'APPLICATION', 'FIRST', 'NAMED', 'APPLICANT',
+}
+
+
+def _docket_match(pattern: str, txt: str, flags: int = re.I):
+    """Return a regex match for a docket-number pattern, or None if the captured
+    value is a known stopword (column-header token, not an actual docket number)."""
+    mo = re.search(pattern, txt, flags)
+    if mo and mo.group(1).upper() not in _DOCKET_STOPWORDS:
+        return mo
+    return None
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -693,6 +677,20 @@ def odp_validate_chain(ads: Dict, receipt: Dict, api_key: str) -> str:
     return '\n'.join(lines)
 
 
+_RECEIPT_END_PATTERN = re.compile(r'Protecting Your Invention Outside the United States', re.I)
+
+
+def _truncate_receipt_text(text: str) -> str:
+    """Truncate filing receipt OCR text at the end-of-receipt boilerplate marker.
+
+    Everything from "Protecting Your Invention Outside the United States" onward
+    is advisory boilerplate (and may be followed by appended fee records or other
+    documents). Dropping it keeps parsing focused on the substantive receipt pages.
+    """
+    m = _RECEIPT_END_PATTERN.search(text)
+    return text[:m.start()] if m else text
+
+
 def parse_receipt(text: str) -> Dict[str, Any]:
     data: Dict[str, Any] = {
         'application_number':  '',
@@ -739,53 +737,49 @@ def parse_receipt(text: str) -> Dict[str, Any]:
     # "ATTY.DOCKET NO." (period-separated, abbreviated header on filing receipt)
     # "ATTY./DOCKET NO./TITLE" (informational notice page 1)
     # Value may appear on the same line or on the next line (PSM-6 table layout).
-    # We allow \s+ (including newlines) between the label and value, but reject
-    # common non-docket tokens that would be grabbed from a wrapped header row.
-    _DOCKET_STOPWORDS = {'TOT', 'TOTAL', 'IND', 'INDEPENDENT', 'CLAIMS', 'FILING',
-                         'DATE', 'GRP', 'ART', 'UNIT', 'FIL', 'FEE', 'RECD', 'NUMBER',
-                         'APPLICATION', 'FIRST', 'NAMED', 'APPLICANT'}
-
-    def _docket_match(pattern, txt, flags=re.I):
-        mo = re.search(pattern, txt, flags)
-        if mo and mo.group(1).upper() not in _DOCKET_STOPWORDS:
-            return mo
-        return None
-
     m = (_docket_match(r'ATTY[./\s]+DOCKET[./\s]+NO[./\s]*(?:TITLE\s+)?(\S+)', text, re.I | re.DOTALL)
          or _docket_match(r'Attorney\s+Docket\s+(?:Number|No)\.?\s*:?\s*(\S+)', text, re.I)
          or _docket_match(r'(?<!\w)Docket\s+(?:Number|No)\.?\s*:?\s*(\S+)', text, re.I))
     if m:
         data['docket_number'] = m.group(1)
 
-    # Fallback: Tesseract often drops the column-header row and emits only the data row.
-    # That row is the only line containing the app# and a date and a mixed letter+digit token.
-    # Format: "{app#} {date} [art_unit] {docket} [tot_claims] [ind_claims]"
-    #         or "{app#} {date} {FirstName} {LastName} {docket}"  (informational notice)
-    # The docket is the unique token on that line that contains BOTH letters and digits.
-    if not data['docket_number'] and data['application_number']:
-        app_bare = data['application_number'].replace(',', '')
-        for line in text.split('\n'):
-            if (app_bare in line.replace(',', '')
-                    and re.search(r'\d{2}/\d{2}/\d{4}', line)):
-                # Strip out app# and filing date, then find the mixed letter+digit token.
-                stripped = re.sub(r'\b\d{2}/\d{3}[,]?\d{3}\b', '', line)
-                stripped = re.sub(r'\b\d{2}/\d{2}/\d{4}\b', '', stripped)
-                for tok in stripped.split():
-                    if (len(tok) >= 4
-                            and re.search(r'[A-Za-z]', tok)
-                            and re.search(r'\d', tok)
-                            and '/' not in tok):
-                        data['docket_number'] = tok
-                        break
-            if data['docket_number']:
-                break
-
-    m = re.search(r'TOT\s+CLAIMS\s+(\d+)', text, re.I)
+    m = re.search(r'\bTOT(?:AL)?\s+CLAIMS\s+(\d+)', text, re.I)
     if m:
         data['total_claims'] = m.group(1)
-    m = re.search(r'IND\s+CLAIMS\s+(\d+)', text, re.I)
+    m = re.search(r'\bIND(?:EPENDENT)?\s+CLAIMS\s+(\d+)', text, re.I)
     if m:
         data['independent_claims'] = m.group(1)
+
+    # Fallback for docket and/or claims: both live on the same header data row.
+    # Format: "{app#} {date} [{art_unit_4d}] {docket} {tot_claims} {ind_claims}"
+    # One pass extracts whichever values are still missing.
+    # Art units are always 4 digits; claim counts are 1-3 digits — that distinction
+    # lets us reliably separate them without knowing the art unit in advance.
+    need_docket = not data['docket_number']
+    need_claims = not data['total_claims'] or not data['independent_claims']
+    if (need_docket or need_claims) and data['application_number']:
+        app_bare = data['application_number'].replace(',', '')
+        for line in text.split('\n'):
+            if app_bare in line.replace(',', '') and re.search(r'\d{2}/\d{2}/\d{4}', line):
+                stripped = re.sub(r'\b\d{2}/\d{3}[,]?\d{3}\b', '', line)
+                stripped = re.sub(r'\b\d{2}/\d{2}/\d{4}\b', '', stripped)
+                toks = stripped.split()
+                if need_docket:
+                    for tok in toks:
+                        if (len(tok) >= 4
+                                and re.search(r'[A-Za-z]', tok)
+                                and re.search(r'\d', tok)
+                                and '/' not in tok):
+                            data['docket_number'] = tok
+                            break
+                if need_claims:
+                    int_tokens = [t for t in toks if re.fullmatch(r'\d{1,3}', t)]
+                    if len(int_tokens) >= 2:
+                        if not data['total_claims']:
+                            data['total_claims'] = int_tokens[-2]
+                        if not data['independent_claims']:
+                            data['independent_claims'] = int_tokens[-1]
+                break
 
     m = re.search(
         r'(?:^|\n)\s*Title\s*\n(.*?)(?=\n\s*(?:Preliminary Class|Statement under|\Z))',
@@ -900,26 +894,6 @@ def _norm(s: str) -> str:
 def _norm_appnum(s: str) -> str:
     """Normalize a USPTO application number for comparison by stripping / and ,."""
     return re.sub(r'[/,\s]', '', (s or '').strip())
-
-
-def _normalize_app_number(raw: str) -> str:
-    """Canonicalize application numbers to XX/XXX,XXX format.
-
-    OCR and copy/paste introduce variants:
-      - Dot instead of comma: 17/828.692
-      - Spaces instead of separators: 17 828 692
-      - No separators at all: 17828692
-      - Mixed: 17/828 692
-
-    This function accepts all variants and returns canonical XX/XXX,XXX.
-    If the input doesn't match a 7-digit pattern, it's returned unchanged.
-    """
-    raw = (raw or '').strip()
-    # Remove all separators and whitespace — should leave 7 digits
-    clean = re.sub(r'[/,.\s]', '', raw)
-    if len(clean) == 7 and clean[:2].isdigit() and clean[2:].isdigit():
-        return f'{clean[:2]}/{clean[2:5]},{clean[5:7]}'
-    return raw
 
 
 def _fmt_ads_name(inv: Dict) -> str:
@@ -1155,24 +1129,10 @@ _ADDITIONAL_DOC_PATTERNS: List[tuple] = [
      'Office Action'),
     (re.compile(r'(?:^|\n)\s*RESTRICTION\s+REQUIREMENT', re.I | re.MULTILINE),
      'Restriction Requirement'),
-    (re.compile(r'(?:^|\n)\s*ELECTION\s+/\s+RESTRICTION', re.I | re.MULTILINE),
-     'Election/Restriction'),
-    (re.compile(r'(?:^|\n)\s*NOTICE\s+OF\s+APPEAL', re.I | re.MULTILINE),
-     'Notice of Appeal'),
-    (re.compile(r'(?:^|\n)\s*INTERVIEW\s+SUMMARY', re.I | re.MULTILINE),
-     'Interview Summary'),
-    (re.compile(r'(?:^|\n)\s*NOTICE\s+OF\s+REFERENCES\s+CITED', re.I | re.MULTILINE),
-     'Notice of References Cited'),
-    (re.compile(r'(?:^|\n)\s*INFORMATION\s+DISCLOSURE\s+STATEMENT', re.I | re.MULTILINE),
-     'Information Disclosure Statement'),
     (re.compile(r'(?:^|\n)\s*NOTICE\s+REGARDING\s+(?:OATH\s+OR\s+)?DECLARATIONS?', re.I | re.MULTILINE),
      'Notice Regarding Declarations / Oath'),
     (re.compile(r'(?:^|\n)\s*NOTICE\s+OF\s+INFORMAL\s+APPLICATION', re.I | re.MULTILINE),
      'Notice of Informal Application'),
-    (re.compile(r'(?:^|\n)\s*NOTICE\s+OF\s+NON-COMPLIANT\s+AMENDMENT', re.I | re.MULTILINE),
-     'Notice of Non-Compliant Amendment'),
-    (re.compile(r'(?:^|\n)\s*NOTICE\s+OF\s+DRAFTSPERSON[\'S]*\s+PATENT\s+DRAWING\s+REVIEW', re.I | re.MULTILINE),
-     "Notice of Draftsperson's Patent Drawing Review"),
 ]
 
 
@@ -1195,7 +1155,7 @@ def render_markdown(
         app_number: str, filing_date: str,
         confirmation: str,
         total_claims: str, ind_claims: str,
-        additional_docs: List[str] | None = None,
+        additional_docs: Optional[List[str]] = None,
 ) -> str:
     """Render the comparison rows as a Markdown table with header and summary."""
     lines = [
@@ -1330,7 +1290,6 @@ def _tesseract_ocr_images(image_paths: List[Path]) -> str:
     """
     if not _PYTESSERACT:
         return ''
-    import shutil
 
     # On Windows, Tesseract is often not on PATH — check the common install location.
     tess_exe = shutil.which('tesseract')
@@ -1441,6 +1400,7 @@ def main() -> None:
 
         if ocr_text:
             # Tesseract path — run the standard comparison pipeline
+            ocr_text = _truncate_receipt_text(ocr_text)
             receipt_data = parse_receipt(ocr_text)
             print(
                 f"  -> {len(receipt_data['inventors'])} inventor(s), "
@@ -1465,9 +1425,8 @@ def main() -> None:
                 print(odp_validate_chain(ads_data, receipt_data, odp_key))
             # Clean up rendered images — they contain client PII (inventor names,
             # docket numbers) and are no longer needed once OCR is complete.
-            import shutil as _shutil
             try:
-                _shutil.rmtree(img_dir)
+                shutil.rmtree(img_dir)
             except Exception:
                 pass
             sys.exit(0)
@@ -1507,6 +1466,7 @@ def main() -> None:
         sys.exit(2)
 
     # Text extraction succeeded — run full comparison
+    receipt_text = _truncate_receipt_text(receipt_text)
     receipt_data = parse_receipt(receipt_text)
     print(
         f"  -> {len(receipt_data['inventors'])} inventor(s), "
