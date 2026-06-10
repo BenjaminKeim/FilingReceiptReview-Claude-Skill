@@ -184,6 +184,24 @@ File order doesn't matter — the script auto-detects which is the ADS (XFA form
 
 ## Changelog
 
+### v1.5.0 — XFA ContentArea fix, receipt truncation, claims extraction, code cleanup
+
+- **Bug fix (critical) — XFA inventor extraction:** Some ADS forms nest `sfApplicantInformation` blocks inside intermediate `ContentArea*` wrapper elements rather than as direct children of `<us-request>`. The previous `_find_direct_children()` call only searched one level deep and returned nothing for these forms. Fixed by switching to a full-subtree `iter()` scan with name-based deduplication to guard against any duplicates introduced by nested wrappers.
+
+- **Bug fix — docket number false match on fee table:** The `Docket Number` heading pattern was matching "Application or **Docket Number**" in the fee determination record header, then grabbing the word "Substitute" (from "Substitute for Form PTO-875") off the next line. Fixed by truncating OCR text at the end-of-receipt boilerplate boundary before parsing.
+
+- **New — receipt text truncation:** OCR text is now truncated at the first occurrence of "Protecting Your Invention Outside the United States" before parsing. Everything from that phrase onward is advisory boilerplate and appended fee records that are not part of the substantive filing receipt. This prevents false field matches in boilerplate, speeds up regex scanning, and avoids misidentifying fee-table entries as docket numbers or other fields.
+
+- **Bug fix — total and independent claims not extracted:** Claims were reported as `— / —` for image-only (OCR) receipts because the label-based patterns (`TOT CLAIMS`, `IND CLAIMS`) did not match the fee table format and the fee table was in the boilerplate section. Added a fallback that reads the last two 1–3 digit integers from the header data row (`{app#} {date} {art_unit} {docket} {tot} {ind}`), which is always present and reliably OCR-readable. Art units are always 4 digits, so filtering to 1–3 digit tokens cleanly separates them from claim counts.
+
+- **Code cleanup — dead code removed:** Deleted three items with no callers: `_find_direct_children()` (replaced by `iter()` scan), `_normalize_app_number()` (defined but never called), and the `closing_phrases` list in `render_receipt_images()` (superseded by `_RECEIPT_END_PATTERN` text truncation).
+
+- **Code cleanup — module-level promotion:** `_DOCKET_STOPWORDS` and `_docket_match()` were recreated inside `parse_receipt()` on every call; both are now module-level. `shutil` was imported inside two function bodies; moved to the top-level import block.
+
+- **Code cleanup — merged header-row scan loops:** The docket fallback and claims fallback previously made two separate passes over `text.split('\n')` looking for the same header data row. Combined into a single pass; `stripped.split()` result cached and shared between both extractions.
+
+- **Code cleanup — type hint consistency:** `List[str] | None` in `render_markdown` signature changed to `Optional[List[str]]` to match the `Optional[...]` style used throughout the rest of the file.
+
 ### v1.4.0 — Documentation-guided robustness and clarity
 
 Implements 5 improvements from patent document extraction best practices to increase reliability and code maintainability:
