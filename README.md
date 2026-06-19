@@ -184,6 +184,14 @@ File order doesn't matter — the script auto-detects which is the ADS (XFA form
 
 ## Changelog
 
+### v1.5.1 — Page-type classification, docket stopword fix, foreign priority parsing
+
+- **New — page-type classification system:** Added `_PAGE_SKIP_PATTERNS` (pre-compiled patterns at module load) and `_classify_receipt_page()` to identify and skip non-receipt pages bundled in the filing receipt PDF — fee determination records and USPTO welcome pages. Used in two places: `_extract_receipt_text()` now skips non-receipt pages during pdfplumber extraction before they enter any parser, and `render_receipt_images()` does a quick 1× pre-scan to avoid the expensive 3× full-resolution render for non-receipt pages. Prevents field parsers from ever seeing fee-table or welcome-page content regardless of whether text truncation (`_RECEIPT_END_PATTERN`) fires.
+
+- **Bug fix — additional docket false-match:** Added `'SUBSTITUTE'` to `_DOCKET_STOPWORDS`. When Tesseract OCR runs on a fee determination page, it produces "Application or Docket Number\nSubstitute" (from "Substitute for Form PTO-875"); the third docket regex pattern (`\s` matches `\n`) captured "Substitute" as the docket number. The stopword rejection now guards against this even when the page classification system doesn't catch the page.
+
+- **New — `_parse_foreign_priority_section()` function:** Extracted foreign priority entry parsing from inline code in `parse_receipt()` into a dedicated function with a documented 3-strategy approach: (1) structured regex matching the standard USPTO receipt format (`COUNTRY app_number MM/DD/YYYY`), (2) ADS-anchored proximity search using known app numbers and filing dates as anchors, (3) signal detection that returns `is_partial=True` to distinguish "something is present but couldn't be parsed" from "definitively absent." The `compare()` function now raises `[DISCREPANCY]` rather than `[CRITICAL DISCREPANCY]` when a partial signal is detected, preventing false critical-flag escalation on foreign priority entries that OCR rendered unreadable.
+
 ### v1.5.0 — XFA ContentArea fix, receipt truncation, claims extraction, code cleanup
 
 - **Bug fix (critical) — XFA inventor extraction:** Some ADS forms nest `sfApplicantInformation` blocks inside intermediate `ContentArea*` wrapper elements rather than as direct children of `<us-request>`. The previous `_find_direct_children()` call only searched one level deep and returned nothing for these forms. Fixed by switching to a full-subtree `iter()` scan with name-based deduplication to guard against any duplicates introduced by nested wrappers.

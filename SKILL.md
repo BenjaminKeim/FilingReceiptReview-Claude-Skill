@@ -145,7 +145,7 @@ Domestic Benefit and Foreign Priority rows always use `[CRITICAL DISCREPANCY]` w
 | Customer Number | From ADS correspondence field; from receipt "Power of Attorney" line |
 | ADS Signature Date vs. Filing Date | ADS date (YYYY-MM-DD) reformatted to MM/DD/YYYY for comparison |
 | Inventor Count | Total inventors |
-| Inventor N — Name | Levenshtein edit distance; 1–2 char differences flagged as `[DISCREPANCY]` with note that it may be an OCR artifact (i/l/1 confusion) |
+| Inventor N — Name | ADS first+middle+last vs. receipt full name |
 | Inventor N — City, Country | ADS ISO country code expanded to full name before comparing |
 | Domestic Benefit Claim | None / app number(s) |
 | Foreign Priority Claim | None / app number(s) + country |

@@ -336,6 +336,8 @@ def _extract_receipt_text(pdf_path: Path) -> str:
                     # Call extract_text() once — it re-parses the page on every call.
                     t = page.extract_text()
                     if t:
+                        if _classify_receipt_page(t) != 'receipt':
+                            continue
                         parts.append(t)
                 text = '\n'.join(parts)
                 if text.strip():
@@ -356,8 +358,9 @@ def _extract_receipt_text(pdf_path: Path) -> str:
 def render_receipt_images(pdf_path: Path, out_dir: Path, max_pages: int = 6) -> List[Path]:
     """Render filing receipt pages to PNG images until document end or max_pages.
 
-    Boilerplate truncation is handled at the OCR-text level by _truncate_receipt_text,
-    so all pages up to max_pages are rendered here. Returns list of rendered image paths.
+    Non-receipt pages (fee determination record, USPTO welcome page) are skipped
+    via a cheap low-resolution pre-scan so their content never enters parsing and
+    the expensive 3× render is avoided for those pages.
     """
     if not _PDFIUM:
         return []
@@ -365,14 +368,36 @@ def render_receipt_images(pdf_path: Path, out_dir: Path, max_pages: int = 6) -> 
     doc = pdfium.PdfDocument(str(pdf_path))
     try:
         paths = []
+        skipped: List[str] = []
         for i, page in enumerate(doc):
             if i >= max_pages:
                 break
+
+            # Quick low-res pre-scan: render at 1× (~72 dpi), crop to top third
+            # (identifying headings always appear there), run fast OCR to classify.
+            # If the page is not a receipt page, skip the full 3× render entirely.
+            if _PYTESSERACT:
+                try:
+                    quick_bmp = page.render(scale=1.0)
+                    quick_img = quick_bmp.to_pil()
+                    w, h = quick_img.size
+                    top_crop = quick_img.crop((0, 0, w, h // 3))
+                    quick_text = pytesseract.image_to_string(top_crop, config='--psm 6')
+                    page_type = _classify_receipt_page(quick_text)
+                    if page_type != 'receipt':
+                        skipped.append(f'page {i + 1} ({page_type})')
+                        continue
+                except Exception:
+                    pass  # classification failed — fall through to full render
+
             bitmap = page.render(scale=3.0)   # ~216 dpi — clear enough for OCR/vision
             pil_img = bitmap.to_pil()
             img_path = out_dir / f"receipt_page_{i + 1}.png"
             pil_img.save(str(img_path))
             paths.append(img_path)
+
+        if skipped:
+            print(f"  -> Skipped non-receipt pages: {', '.join(skipped)}", file=sys.stderr)
     finally:
         doc.close()   # release C-level PDF resources
     return paths
@@ -415,6 +440,11 @@ _DOCKET_STOPWORDS = {
     'TOT', 'TOTAL', 'IND', 'INDEPENDENT', 'CLAIMS', 'FILING',
     'DATE', 'GRP', 'ART', 'UNIT', 'FIL', 'FEE', 'RECD', 'NUMBER',
     'APPLICATION', 'FIRST', 'NAMED', 'APPLICANT',
+    # "Substitute for Form PTO-875" appears on page 1 of the fee determination
+    # record; Tesseract OCR sees "Application or Docket Number\nSubstitute"
+    # and the third docket regex crosses the newline (because \s matches \n),
+    # capturing "Substitute" as the docket number.
+    'SUBSTITUTE',
 }
 
 
@@ -425,6 +455,37 @@ def _docket_match(pattern: str, txt: str, flags: int = re.I):
     if mo and mo.group(1).upper() not in _DOCKET_STOPWORDS:
         return mo
     return None
+
+
+# ── Page-type classification ─────────────────────────────────────────────────
+# Filing receipt PDFs often bundle additional pages (fee determination record,
+# USPTO welcome page) that contain no useful receipt data and can confuse the
+# parsers.  These pages are identified by distinctive headings near the top and
+# are excluded before any parsing occurs.
+
+_PAGE_SKIP_PATTERNS: List[tuple] = [
+    (re.compile(r'PATENT\s+APPLICATION\s+FEE\s+DETERMINATION\s+RECORD', re.I),
+     'fee_determination'),
+    (re.compile(r'Substitute\s+for\s+Form\s+PTO-?875', re.I),
+     'fee_determination'),
+    (re.compile(r'Welcome\s+to\s+the\s+U\.?S\.?\s+Patent\s+and\s+Trademark\s+Office', re.I),
+     'welcome'),
+    (re.compile(r'Congratulations\s+on\s+taking\s+the\s+first\s+step\s+to\s+protect', re.I),
+     'welcome'),
+]
+
+
+def _classify_receipt_page(text: str) -> str:
+    """Return 'fee_determination', 'welcome', or 'receipt'.
+
+    Only the first 600 characters are checked — the identifying phrases always
+    appear near the top of non-receipt pages.
+    """
+    head = text[:600]
+    for pattern, page_type in _PAGE_SKIP_PATTERNS:
+        if pattern.search(head):
+            return page_type
+    return 'receipt'
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -680,6 +741,143 @@ def odp_validate_chain(ads: Dict, receipt: Dict, api_key: str) -> str:
 _RECEIPT_END_PATTERN = re.compile(r'Protecting Your Invention Outside the United States', re.I)
 
 
+def _parse_foreign_priority_section(
+        for_text: str,
+        ads_fp_entries: Optional[List[Dict]] = None,
+):
+    """Parse foreign priority entries from the filing receipt's foreign-priority section.
+
+    Returns ``(entries, is_partial)`` where:
+
+    - *entries* non-empty, *is_partial* False — full parse via Strategy 1 or 2;
+      compare normally.
+    - *entries* empty, *is_partial* True — ADS signals found in the section text
+      but the entry could not be assembled; caller should raise [DISCREPANCY]
+      (something is present but unreadable — needs manual review).
+    - *entries* empty, *is_partial* False — no ADS signals found; if the ADS
+      claimed foreign priority the caller raises [CRITICAL DISCREPANCY].
+
+    Strategies (tried in order):
+
+    1. **Structured regex** — standard USPTO receipt format:
+         ``COUNTRY_NAME app_number MM/DD/YYYY [trailing text]``
+       Country may be multi-word all-caps (e.g. ``UNITED KINGDOM``).
+
+    2. **ADS-anchored proximity search** — search for the exact ADS app number
+       in the section text; if found, extract the country name and date from
+       the surrounding ±80 characters.  Falls back to anchoring on the filing
+       date if the app number was not found.  A result is only accepted as a
+       full match when the country name is also present — an app-number-only
+       hit is too ambiguous and falls through to Strategy 3.
+
+    3. **Signal detection** — look for ANY individual ADS value (app number,
+       filing date, or country name) anywhere in the section text.  A hit means
+       something is there but could not be parsed → ``is_partial = True``.
+       This strategy is suppressed entirely when ``ads_fp_entries`` is empty, so
+       it can never produce a false positive when the ADS claims no foreign
+       priority.
+    """
+
+    # ── Strategy 1: structured regex ────────────────────────────────────────
+    structured = re.findall(
+        r'([A-Z]{2,}(?:\s+[A-Z]{2,})*)\s+(\d{4,})\s+(\d{2}/\d{2}/\d{4})',
+        for_text,
+    )
+    if structured:
+        return (
+            [{'app_number': e[1], 'country': e[0], 'date': e[2]} for e in structured],
+            False,
+        )
+
+    # Strategies 2 and 3 require ADS anchor values.
+    if not ads_fp_entries:
+        return ([], False)
+
+    flat = re.sub(r'\s+', ' ', for_text)
+
+    # ── Strategy 2: ADS-anchored proximity search ────────────────────────────
+    for ads_entry in ads_fp_entries:
+        app_num      = (ads_entry.get('app_number') or '').strip()
+        ads_date_raw = (ads_entry.get('date') or '').strip()
+
+        # Normalise ADS date (YYYY-MM-DD) → MM/DD/YYYY for receipt comparison.
+        if re.match(r'\d{4}-\d{2}-\d{2}', ads_date_raw):
+            y, mo, d = ads_date_raw.split('-')
+            receipt_date = f'{mo}/{d}/{y}'
+        elif re.match(r'\d{2}/\d{2}/\d{4}', ads_date_raw):
+            receipt_date = ads_date_raw
+        else:
+            receipt_date = ads_date_raw
+
+        entry: Dict = {'app_number': '', 'country': '', 'date': ''}
+
+        # Anchor on the ADS app number (exact match), then look ±80 chars for
+        # the country name and date.  Only accept as a full result when the
+        # country is also found — an entry missing the country is too ambiguous.
+        if app_num:
+            m = re.search(re.escape(app_num), flat)
+            if m:
+                window = flat[max(0, m.start() - 80): m.end() + 80]
+                entry['app_number'] = app_num
+                cm = re.search(
+                    r'([A-Z]{2,}(?:\s+[A-Z]{2,})*)\s+' + re.escape(app_num),
+                    window,
+                )
+                if cm:
+                    entry['country'] = cm.group(1)
+                dm = re.search(r'(\d{2}/\d{2}/\d{4})', window)
+                if dm:
+                    entry['date'] = dm.group(1)
+
+                if entry['country']:
+                    return ([entry], False)
+                # App number found but country missing — fall through.
+
+        # Anchor on the ADS filing date, then look ±120 chars before for the
+        # app number and country.  Accept if both are found.
+        if receipt_date:
+            m = re.search(re.escape(receipt_date), flat)
+            if m:
+                window = flat[max(0, m.start() - 120): m.end() + 40]
+                entry['date'] = receipt_date
+                if not entry['app_number']:
+                    nm = re.search(r'(\d{7,})', window)
+                    if nm:
+                        entry['app_number'] = nm.group(1)
+                if not entry['country']:
+                    cm = re.search(r'([A-Z]{2,}(?:\s+[A-Z]{2,})*)', window)
+                    if cm:
+                        entry['country'] = cm.group(1)
+
+                if entry['app_number'] and entry['country']:
+                    return ([entry], False)
+                # Date found but entry still incomplete — fall through.
+
+    # ── Strategy 3: signal detection ────────────────────────────────────────
+    # Strategy 2 couldn't build a complete entry.  Check whether any individual
+    # ADS value (app number, date, or country name) appears anywhere in the
+    # section.  A hit means something is present but unreadable → is_partial=True,
+    # so the caller raises [DISCREPANCY] rather than [CRITICAL DISCREPANCY].
+    for ads_entry in ads_fp_entries:
+        app_num      = (ads_entry.get('app_number') or '').strip()
+        ads_date_raw = (ads_entry.get('date') or '').strip()
+        if re.match(r'\d{4}-\d{2}-\d{2}', ads_date_raw):
+            y, mo, d = ads_date_raw.split('-')
+            receipt_date = f'{mo}/{d}/{y}'
+        else:
+            receipt_date = ads_date_raw
+        country = _expand_country(ads_entry.get('country') or '')
+
+        if (
+            (app_num      and re.search(re.escape(app_num), flat))
+            or (receipt_date and re.search(re.escape(receipt_date), flat))
+            or (country       and re.search(re.escape(country), flat, re.I))
+        ):
+            return ([], True)   # partial — something is there but unreadable
+
+    return ([], False)   # nothing found
+
+
 def _truncate_receipt_text(text: str) -> str:
     """Truncate filing receipt OCR text at the end-of-receipt boilerplate marker.
 
@@ -691,7 +889,7 @@ def _truncate_receipt_text(text: str) -> str:
     return text[:m.start()] if m else text
 
 
-def parse_receipt(text: str) -> Dict[str, Any]:
+def parse_receipt(text: str, ads_fp_entries: Optional[List[Dict]] = None) -> Dict[str, Any]:
     data: Dict[str, Any] = {
         'application_number':  '',
         'filing_date':         '',
@@ -706,6 +904,7 @@ def parse_receipt(text: str) -> Dict[str, Any]:
         'domestic_benefit':         [],
         'domestic_benefit_details': [],   # [{app_number, date, patent_number}, ...]
         'foreign_priority':         [],
+        'foreign_priority_partial': False,  # True = signals found but entry unreadable
         'non_publication':          None,
         'early_publication':        None,
         'domestic_none':            False,
@@ -854,22 +1053,26 @@ def parse_receipt(text: str) -> Dict[str, Any]:
                 data['domestic_benefit']         = [d['app_number'] for d in details]
                 data['domestic_benefit_details'] = details
 
-    for_m = re.search(
-        r'Foreign Applications for which priority is claimed.*?'
-        r'(?=\n\s*(?:Permission|$))',
-        text, re.DOTALL | re.I
-    )
-    if for_m:
-        for_text = for_m.group(0)
-        if re.search(r'[-–]\s*None', for_text, re.I):
-            data['foreign_none'] = True
-        else:
-            entries = re.findall(r'(\S+)\s+([A-Z]{2})\s+(\d{2}/\d{2}/\d{4})', for_text)
-            if entries:
-                data['foreign_priority'] = [
-                    {'app_number': e[0], 'country': e[1], 'date': e[2]}
-                    for e in entries
-                ]
+    # Foreign priority — only search when the ADS claims foreign priority.
+    # If the ADS has none, the receipt will say "None" too, and complex parsing
+    # is unnecessary and risks false positives.
+    if ads_fp_entries:
+        for_m = re.search(
+            r'Foreign Applications for which priority is claimed.*?'
+            r'(?=\n\s*(?:Permission|$))',
+            text, re.DOTALL | re.I
+        )
+        if for_m:
+            for_text = for_m.group(0)
+            if re.search(r'[-–]\s*None', for_text, re.I):
+                data['foreign_none'] = True
+            else:
+                fp_entries, fp_partial = _parse_foreign_priority_section(
+                    for_text, ads_fp_entries
+                )
+                if fp_entries:
+                    data['foreign_priority'] = fp_entries
+                data['foreign_priority_partial'] = fp_partial
 
     m = re.search(r'Non-Publication Request:\s+(Yes|No)', text, re.I)
     if m:
@@ -1072,10 +1275,11 @@ def compare(ads: Dict, receipt: Dict) -> List[Row]:
                      critical=True))
 
     # Foreign priority
-    ads_for = bool(ads['foreign_priority'])
-    rec_for = bool(receipt['foreign_priority'])
-    rec_for_none = receipt.get('foreign_none', False)
-    no_for_both  = not ads_for and (not rec_for or rec_for_none)
+    ads_for         = bool(ads['foreign_priority'])
+    rec_for         = bool(receipt['foreign_priority'])
+    rec_for_none    = receipt.get('foreign_none', False)
+    rec_for_partial = receipt.get('foreign_priority_partial', False)
+    no_for_both     = not ads_for and (not rec_for or rec_for_none)
     ads_for_str  = ('None' if not ads_for
                     else '; '.join(
                         f"{e.get('app_number','')} "
@@ -1086,9 +1290,24 @@ def compare(ads: Dict, receipt: Dict) -> List[Row]:
                         f"{e.get('app_number','')} "
                         f"({_expand_country(e.get('country',''))})"
                         for e in receipt['foreign_priority']))
-    rows.append(_row('Foreign Priority Claim', ads_for_str, rec_for_str,
-                     match_override=(True if no_for_both else None),
-                     critical=True))
+
+    if ads_for and rec_for_partial and not rec_for:
+        # ADS claims foreign priority; something was detected in the receipt's
+        # foreign-priority section but could not be parsed into a complete entry.
+        # Raise [DISCREPANCY] (manual review needed) rather than [CRITICAL
+        # DISCREPANCY] (which would imply the claim is definitively absent).
+        rows.append(_row(
+            'Foreign Priority Claim',
+            ads_for_str,
+            '*(signals detected — could not be parsed; manual review required)*',
+            note='Foreign priority signals found in receipt but entry parsing failed',
+            match_override=False,
+            critical=False,
+        ))
+    else:
+        rows.append(_row('Foreign Priority Claim', ads_for_str, rec_for_str,
+                         match_override=(True if no_for_both else None),
+                         critical=True))
 
     # Non-publication (only if receipt recorded it)
     # ADS None (not set) is treated as No — same practical meaning as unchecked.
@@ -1306,6 +1525,10 @@ def _tesseract_ocr_images(image_paths: List[Path]) -> str:
             # PSM 6: assume a single uniform block of text — works well for USPTO receipts.
             text = pytesseract.image_to_string(str(img_path), config='--psm 6')
             if text.strip():
+                # Safety filter: render_receipt_images already excludes non-receipt
+                # pages via its pre-scan, but guard here in case it was bypassed.
+                if _classify_receipt_page(text) != 'receipt':
+                    continue
                 parts.append(text)
         except Exception as e:
             print(f"  WARNING: Tesseract failed on {img_path.name}: {e}", file=sys.stderr)
@@ -1401,7 +1624,7 @@ def main() -> None:
         if ocr_text:
             # Tesseract path — run the standard comparison pipeline
             ocr_text = _truncate_receipt_text(ocr_text)
-            receipt_data = parse_receipt(ocr_text)
+            receipt_data = parse_receipt(ocr_text, ads_fp_entries=ads_data.get('foreign_priority'))
             print(
                 f"  -> {len(receipt_data['inventors'])} inventor(s), "
                 f"app# {receipt_data['application_number']}",
@@ -1467,7 +1690,7 @@ def main() -> None:
 
     # Text extraction succeeded — run full comparison
     receipt_text = _truncate_receipt_text(receipt_text)
-    receipt_data = parse_receipt(receipt_text)
+    receipt_data = parse_receipt(receipt_text, ads_fp_entries=ads_data.get('foreign_priority'))
     print(
         f"  -> {len(receipt_data['inventors'])} inventor(s), "
         f"app# {receipt_data['application_number']}",
