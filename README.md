@@ -4,7 +4,7 @@ A [Claude Code](https://claude.ai/claude-code) skill that compares a USPTO **Fil
 
 ## What It Does
 
-After a U.S. patent application is filed, the USPTO issues a Filing Receipt recording the inventors, title, docket number, priority claims, and other bibliographic data it captured from the ADS. Errors on the Filing Receipt must be caught early and corrected promptly — especially for inventor names and priority claims.
+After a U.S. patent application is filed, the USPTO issues a Filing Receipt identifying the inventors, title, docket number, priority claims, and other bibliographic data it captured from the ADS. Errors on the Filing Receipt must be caught early and corrected promptly — especially for inventor names and priority claims.
 
 This skill automates that review by:
 
@@ -184,7 +184,7 @@ File order doesn't matter — the script auto-detects which is the ADS (XFA form
 
 ## Changelog
 
-### v1.6.0 — Domestic benefit partial detection, C# parity improvements, refactors
+### v1.6.0 — Domestic benefit partial detection, refactors
 
 - **New — domestic benefit partial detection:** Added `domestic_benefit_partial` flag to `parse_receipt()`, parallel to the existing `foreign_priority_partial` flag added in v1.5.1. When the domestic benefit section is present but the app-number regex yields nothing and the section contains a partial app-number signal (`\b\d{2}/\d{3}\b` — the slash-separated prefix without the comma, the most common OCR corruption pattern), `compare()` now emits `[DISCREPANCY]` with a note rather than `[CRITICAL DISCREPANCY]`. Previously, any unreadable domestic benefit section escalated to a critical flag even when the data was present but OCR-garbled.
 
