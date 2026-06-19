@@ -115,7 +115,7 @@ Use this structure for both the script-generated and the manually-produced table
 > **All checked fields are consistent with the Filing Receipt.** [OK]
 
 **Match symbols:** `[OK]` / `[DISCREPANCY]` / `[CRITICAL DISCREPANCY]`
-Domestic Benefit and Foreign Priority rows always use `[CRITICAL DISCREPANCY]` when they do not match.
+Domestic Benefit and Foreign Priority rows use `[CRITICAL DISCREPANCY]` when they do not match; `[DISCREPANCY]` is used when partial signals are detected but the entry could not be fully parsed (manual review required).
 
 | Field | ADS | Filing Receipt | Match |
 |---|---|---|:---:|
@@ -143,7 +143,7 @@ Domestic Benefit and Foreign Priority rows always use `[CRITICAL DISCREPANCY]` w
 | Docket Number | Exact match |
 | Applicant / Assignee | ADS org name contained-in receipt applicant line (receipt appends city/state) |
 | Customer Number | From ADS correspondence field; from receipt "Power of Attorney" line |
-| ADS Signature Date vs. Filing Date | ADS date (YYYY-MM-DD) reformatted to MM/DD/YYYY for comparison |
+| ADS Signature Date vs. Filing Date | ADS date (YYYY-MM-DD) reformatted to MM/DD/YYYY for comparison; note indicates whether ADS was signed before or after the filing date |
 | Inventor Count | Total inventors |
 | Inventor N — Name | Levenshtein edit distance; 1–2 char differences flagged as `[DISCREPANCY]` with note that it may be an OCR artifact (i/l/1 confusion) |
 | Inventor N — City, Country | ADS ISO country code expanded to full name before comparing |

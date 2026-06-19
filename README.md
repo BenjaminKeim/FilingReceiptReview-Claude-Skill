@@ -184,6 +184,22 @@ File order doesn't matter — the script auto-detects which is the ADS (XFA form
 
 ## Changelog
 
+### v1.6.0 — Domestic benefit partial detection, C# parity improvements, refactors
+
+- **New — domestic benefit partial detection:** Added `domestic_benefit_partial` flag to `parse_receipt()`, parallel to the existing `foreign_priority_partial` flag added in v1.5.1. When the domestic benefit section is present but the app-number regex yields nothing and the section contains a partial app-number signal (`\b\d{2}/\d{3}\b` — the slash-separated prefix without the comma, the most common OCR corruption pattern), `compare()` now emits `[DISCREPANCY]` with a note rather than `[CRITICAL DISCREPANCY]`. Previously, any unreadable domestic benefit section escalated to a critical flag even when the data was present but OCR-garbled.
+
+- **Bug fix — domestic continuity duplicate entries:** Added `seen_dom_apps` dedup set in `parse_ads()` for domestic continuity entries, parallel to the existing `seen_inventors` set. Guards against nested `sfDomesticContinuity` XML structures producing duplicate entries when the XFA traversal visits both a parent and a child element bearing the same application number.
+
+- **Bug fix — confirmation number OCR space-splits:** The confirmation number regex now allows digits with intervening spaces in the captured group and strips them before storing (e.g., `"61 07"` → `"6107"`). Handles Tesseract OCR artifacts where a single contiguous number is rendered with an internal space.
+
+- **Bug fix — PyPDF2 fallback includes non-receipt pages:** The PyPDF2 text-extraction fallback (used when pdfplumber is unavailable) now applies the same `_classify_receipt_page()` per-page filter that the pdfplumber path has used since v1.5.1. Previously the fallback concatenated all pages, so fee-determination records and welcome pages could leak into field parsing when pdfplumber was not installed.
+
+- **Enhancement — directional signature date note:** The "ADS Signature Date vs. Filing Date" row now includes a directional note when dates differ — "ADS was signed before the USPTO filing date" or "ADS was signed after the USPTO filing date" — instead of the generic "ADS signature date should equal the USPTO filing date."
+
+- **Refactor — eliminated pipeline duplication:** Extracted `_emit_comparison()` helper shared by both receipt sources (PDF text layer and Tesseract OCR paths). The two paths previously duplicated ~25 lines of truncate → parse → compare → detect-docs → render → ODP code, creating a drift risk where a change applied to one path might silently not apply to the other.
+
+- **Refactor — ODP table row formatting:** Added `_odp_row()` helper inside `odp_validate_chain()` to consolidate 5 copies of the 8-column Markdown table row format string.
+
 ### v1.5.1 — Page-type classification, docket stopword fix, foreign priority parsing
 
 - **New — page-type classification system:** Added `_PAGE_SKIP_PATTERNS` (pre-compiled patterns at module load) and `_classify_receipt_page()` to identify and skip non-receipt pages bundled in the filing receipt PDF — fee determination records and USPTO welcome pages. Used in two places: `_extract_receipt_text()` now skips non-receipt pages during pdfplumber extraction before they enter any parser, and `render_receipt_images()` does a quick 1× pre-scan to avoid the expensive 3× full-resolution render for non-receipt pages. Prevents field parsers from ever seeing fee-table or welcome-page content regardless of whether text truncation (`_RECEIPT_END_PATTERN`) fires.

@@ -267,6 +267,7 @@ def parse_ads(pdf_path: Path) -> Dict[str, Any]:
         data['assignee_org'] = _txt(assignee, 'orgName')
 
     # Domestic continuity
+    seen_dom_apps: set = set()
     for cont in req.iter():
         if _ln(cont) != 'sfDomesticContinuity':
             continue
@@ -278,9 +279,13 @@ def parse_ads(pdf_path: Path) -> Dict[str, Any]:
             cont_type = _txt(info, 'domesContList')
             date      = _txt(info, 'DateTimeField1')
             if app_num or cont_type or date:
-                data['domestic_continuity'].append(
-                    {'app_number': app_num, 'type': cont_type, 'date': date}
-                )
+                key = re.sub(r'[/,\s]', '', app_num) if app_num else ''
+                if not key or key not in seen_dom_apps:
+                    if key:
+                        seen_dom_apps.add(key)
+                    data['domestic_continuity'].append(
+                        {'app_number': app_num, 'type': cont_type, 'date': date}
+                    )
         # Entry 2+: patented ancestors — patContType holds the prior app number
         for pat in cont.iter():
             if _ln(pat) != 'sfDomesContinfoPatent':
@@ -290,6 +295,11 @@ def parse_ads(pdf_path: Path) -> Dict[str, Any]:
             date      = _txt(pat, 'patprDate')
             pat_num   = _txt(pat, 'patPatNum')
             if app_num or cont_type or date or pat_num:
+                key = re.sub(r'[/,\s]', '', app_num) if app_num else ''
+                if key and key in seen_dom_apps:
+                    continue
+                if key:
+                    seen_dom_apps.add(key)
                 data['domestic_continuity'].append(
                     {'app_number': app_num, 'type': cont_type, 'date': date,
                      'patent_number': pat_num}
@@ -344,12 +354,17 @@ def _extract_receipt_text(pdf_path: Path) -> str:
                     return text
         except Exception:
             pass
-    # Fallback: PyPDF2
+    # Fallback: PyPDF2 — apply the same non-receipt page filter as the pdfplumber
+    # path so bundled fee-determination / welcome pages don't pollute parsing.
     try:
         with open(pdf_path, 'rb') as f:
             reader = PyPDF2.PdfReader(f)
-            text = '\n'.join(page.extract_text() or '' for page in reader.pages)
-        return text.strip()
+            parts = []
+            for page in reader.pages:
+                t = page.extract_text() or ''
+                if t and _classify_receipt_page(t) == 'receipt':
+                    parts.append(t)
+        return '\n'.join(parts).strip()
     except Exception as e:
         print(f"  WARNING: PyPDF2 text extraction failed: {e}", file=sys.stderr)
         return ''
@@ -633,6 +648,15 @@ def odp_validate_chain(ads: Dict, receipt: Dict, api_key: str) -> str:
         """Return patent number string for display, or em-dash if blank."""
         return p if p else '—'
 
+    def _odp_row(raw: str, odp_date_col: str, info: Dict,
+                 status: str, odp_pat_col: str = '—') -> str:
+        """Build one 8-column ODP verification table row."""
+        return (
+            f'| {raw} | {odp_date_col} | {info["ads_date"] or "—"} | '
+            f'{info["rec_date"] or "—"} | {odp_pat_col} | {_fmt_pat(info["ads_patent"])} | '
+            f'{_fmt_pat(info["rec_patent"])} | {status} |'
+        )
+
     table_rows: List[str] = []
     notes: List[str] = []
     bad_key = False
@@ -643,11 +667,8 @@ def odp_validate_chain(ads: Dict, receipt: Dict, api_key: str) -> str:
         # Once the API key is known bad, skip further network calls — just mark
         # remaining rows as errored without making additional rejected requests.
         if bad_key:
-            table_rows.append(
-                f'| {raw} | *(API key rejected — skipped)* | {info["ads_date"] or "—"} | '
-                f'{info["rec_date"] or "—"} | — | {info["ads_patent"] or "—"} | '
-                f'{info["rec_patent"] or "—"} | [ERROR] |'
-            )
+            table_rows.append(_odp_row(
+                raw, '*(API key rejected — skipped)*', info, '[ERROR]'))
             continue
 
         print(f"     {raw}", file=sys.stderr)
@@ -656,28 +677,19 @@ def odp_validate_chain(ads: Dict, receipt: Dict, api_key: str) -> str:
 
         if result['error'] == 'bad_key':
             bad_key = True
-            table_rows.append(
-                f'| {raw} | *(API key rejected)* | {info["ads_date"] or "—"} | '
-                f'{info["rec_date"] or "—"} | — | {info["ads_patent"] or "—"} | '
-                f'{info["rec_patent"] or "—"} | [ERROR] |'
-            )
+            table_rows.append(_odp_row(
+                raw, '*(API key rejected)*', info, '[ERROR]'))
             continue
 
         if result['error'] == 'not_found':
-            table_rows.append(
-                f'| {raw} | *(not found)* | {info["ads_date"] or "—"} | '
-                f'{info["rec_date"] or "—"} | — | {info["ads_patent"] or "—"} | '
-                f'{info["rec_patent"] or "—"} | [CRITICAL DISCREPANCY] |'
-            )
+            table_rows.append(_odp_row(
+                raw, '*(not found)*', info, '[CRITICAL DISCREPANCY]'))
             notes.append(f'**{raw}**: Not found in USPTO ODP — verify the application number.')
             continue
 
         if result['error']:
-            table_rows.append(
-                f'| {raw} | *(error: {result["error"]})* | {info["ads_date"] or "—"} | '
-                f'{info["rec_date"] or "—"} | — | {info["ads_patent"] or "—"} | '
-                f'{info["rec_patent"] or "—"} | [ERROR] |'
-            )
+            table_rows.append(_odp_row(
+                raw, f'*(error: {result["error"]})*', info, '[ERROR]'))
             continue
 
         odp_date   = result['filing_date']
@@ -707,12 +719,10 @@ def odp_validate_chain(ads: Dict, receipt: Dict, api_key: str) -> str:
         for issue in issues:
             notes.append(f'**{raw}**: {issue}')
 
-        table_rows.append(
-            f'| {raw} | {odp_date or "—"} | {info["ads_date"] or "—"} | '
-            f'{info["rec_date"] or "—"} | {_fmt_pat(result["patent_number"])} | '
-            f'{_fmt_pat(info["ads_patent"])} | {_fmt_pat(info["rec_patent"])} | '
-            f'{status_cell} ({odp_status}) |'
-        )
+        table_rows.append(_odp_row(
+            raw, odp_date or '—', info,
+            f'{status_cell} ({odp_status})',
+            odp_pat_col=_fmt_pat(result['patent_number'])))
 
     lines = [
         '',
@@ -903,6 +913,7 @@ def parse_receipt(text: str, ads_fp_entries: Optional[List[Dict]] = None) -> Dic
         'customer_number':     '',
         'domestic_benefit':         [],
         'domestic_benefit_details': [],   # [{app_number, date, patent_number}, ...]
+        'domestic_benefit_partial': False,  # True = signals found but entry unreadable
         'foreign_priority':         [],
         'foreign_priority_partial': False,  # True = signals found but entry unreadable
         'non_publication':          None,
@@ -928,9 +939,10 @@ def parse_receipt(text: str, ads_fp_entries: Optional[List[Dict]] = None) -> Dic
     if m:
         data['filing_date'] = m.group(1)
 
-    m = re.search(r'CONFIRMATION\s+NO\.?\s*(\d+)', text, re.I)
+    # Allow a space between digit groups to handle OCR space-splits (e.g. "61 07" → "6107").
+    m = re.search(r'CONFIRMATION\s+NO\.?\s*(\d[\d ]*)', text, re.I)
     if m:
-        data['confirmation_number'] = m.group(1)
+        data['confirmation_number'] = re.sub(r' +', '', m.group(1).rstrip())
 
     # "ATTY DOCKET NO" (space-separated, full filing receipt)
     # "ATTY.DOCKET NO." (period-separated, abbreviated header on filing receipt)
@@ -1052,6 +1064,12 @@ def parse_receipt(text: str, ads_fp_entries: Optional[List[Dict]] = None) -> Dic
             if details:
                 data['domestic_benefit']         = [d['app_number'] for d in details]
                 data['domestic_benefit_details'] = details
+            else:
+                # No full app numbers parsed, but if the section contains digit runs
+                # resembling a malformed app number (e.g. "18/297 576" without the
+                # comma), flag as partial so compare() downgrades to [DISCREPANCY].
+                if re.search(r'\b\d{2}/\d{3}\b', dom_text):
+                    data['domestic_benefit_partial'] = True
 
     # Foreign priority — only search when the ADS claims foreign priority.
     # If the ADS has none, the receipt will say "None" too, and complex parsing
@@ -1186,10 +1204,21 @@ def compare(ads: Dict, receipt: Dict) -> List[Row]:
         ads_sig_disp = f"{mo}/{d}/{y}"
     else:
         ads_sig_disp = ads_sig
+    if ads_sig_disp and receipt['filing_date']:
+        ads_iso = _to_iso(ads_sig_disp)
+        rec_iso = _to_iso(receipt['filing_date'])
+        if ads_iso < rec_iso:
+            sig_note = 'ADS was signed before the USPTO filing date'
+        elif ads_iso > rec_iso:
+            sig_note = 'ADS was signed after the USPTO filing date'
+        else:
+            sig_note = ''
+    else:
+        sig_note = 'ADS signature date should equal the USPTO filing date'
     rows.append(_row(
         'ADS Signature Date vs. Filing Date',
         ads_sig_disp, receipt['filing_date'],
-        note='ADS signature date should equal the USPTO filing date',
+        note=sig_note,
     ))
 
     # Inventor count
@@ -1257,7 +1286,8 @@ def compare(ads: Dict, receipt: Dict) -> List[Row]:
     # Domestic benefit — normalize app numbers (strip /,) before comparing
     ads_dom = bool(ads['domestic_continuity'])
     rec_dom = bool(receipt['domestic_benefit'])
-    rec_dom_none = receipt.get('domestic_none', False)
+    rec_dom_none    = receipt.get('domestic_none', False)
+    rec_dom_partial = receipt.get('domestic_benefit_partial', False)
     no_dom_both  = not ads_dom and (not rec_dom or rec_dom_none)
     ads_dom_nums = [_norm_appnum(e.get('app_number') or '') for e in ads['domestic_continuity']
                     if e.get('app_number')]
@@ -1266,13 +1296,23 @@ def compare(ads: Dict, receipt: Dict) -> List[Row]:
         e.get('app_number') or e.get('type') or '?' for e in ads['domestic_continuity'])
     rec_dom_str  = ('None' if (not rec_dom or rec_dom_none)
                     else '; '.join(receipt['domestic_benefit']))
-    if no_dom_both:
-        dom_match = True
+    if ads_dom and rec_dom_partial and not rec_dom:
+        rows.append(_row(
+            'Domestic Benefit Claim',
+            ads_dom_str,
+            '*(signals detected — could not be parsed; manual review required)*',
+            note='Domestic benefit signals found in receipt but entry parsing failed',
+            match_override=False,
+            critical=False,
+        ))
     else:
-        dom_match = sorted(ads_dom_nums) == sorted(rec_dom_nums)
-    rows.append(_row('Domestic Benefit Claim', ads_dom_str, rec_dom_str,
-                     match_override=dom_match,
-                     critical=True))
+        if no_dom_both:
+            dom_match = True
+        else:
+            dom_match = sorted(ads_dom_nums) == sorted(rec_dom_nums)
+        rows.append(_row('Domestic Benefit Claim', ads_dom_str, rec_dom_str,
+                         match_override=dom_match,
+                         critical=True))
 
     # Foreign priority
     ads_for         = bool(ads['foreign_priority'])
@@ -1539,6 +1579,42 @@ def _tesseract_ocr_images(image_paths: List[Path]) -> str:
 # Entry point
 # ════════════════════════════════════════════════════════════════════════════════
 
+def _emit_comparison(
+        ads_data: Dict, receipt_text: str,
+        ads_path: Path, receipt_path: Path,
+) -> None:
+    """Run the full parse → compare → render → ODP pipeline and print Markdown.
+
+    Shared by both receipt-text sources (PDF text layer and Tesseract OCR) so the
+    two paths can never drift apart.  Takes raw receipt text and truncates it
+    internally at the end-of-receipt boilerplate marker.
+    """
+    receipt_text = _truncate_receipt_text(receipt_text)
+    receipt_data = parse_receipt(receipt_text, ads_fp_entries=ads_data.get('foreign_priority'))
+    print(
+        f"  -> {len(receipt_data['inventors'])} inventor(s), "
+        f"app# {receipt_data['application_number']}",
+        file=sys.stderr,
+    )
+    print("", file=sys.stderr)
+
+    rows = compare(ads_data, receipt_data)
+    extra_docs = detect_additional_documents(receipt_text)
+    print(render_markdown(
+        rows,
+        str(ads_path), str(receipt_path),
+        receipt_data['application_number'],
+        receipt_data['filing_date'],
+        receipt_data['confirmation_number'],
+        receipt_data['total_claims'],
+        receipt_data['independent_claims'],
+        additional_docs=extra_docs,
+    ))
+    odp_key = _load_odp_api_key()
+    if odp_key:
+        print(odp_validate_chain(ads_data, receipt_data, odp_key))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description='Compare a USPTO ADS (XFA PDF) against the Filing Receipt.'
@@ -1623,29 +1699,7 @@ def main() -> None:
 
         if ocr_text:
             # Tesseract path — run the standard comparison pipeline
-            ocr_text = _truncate_receipt_text(ocr_text)
-            receipt_data = parse_receipt(ocr_text, ads_fp_entries=ads_data.get('foreign_priority'))
-            print(
-                f"  -> {len(receipt_data['inventors'])} inventor(s), "
-                f"app# {receipt_data['application_number']}",
-                file=sys.stderr,
-            )
-            print("", file=sys.stderr)
-            rows = compare(ads_data, receipt_data)
-            extra_docs = detect_additional_documents(ocr_text)
-            print(render_markdown(
-                rows,
-                str(ads_path), str(receipt_path),
-                receipt_data['application_number'],
-                receipt_data['filing_date'],
-                receipt_data['confirmation_number'],
-                receipt_data['total_claims'],
-                receipt_data['independent_claims'],
-                additional_docs=extra_docs,
-            ))
-            odp_key = _load_odp_api_key()
-            if odp_key:
-                print(odp_validate_chain(ads_data, receipt_data, odp_key))
+            _emit_comparison(ads_data, ocr_text, ads_path, receipt_path)
             # Clean up rendered images — they contain client PII (inventor names,
             # docket numbers) and are no longer needed once OCR is complete.
             try:
@@ -1689,30 +1743,7 @@ def main() -> None:
         sys.exit(2)
 
     # Text extraction succeeded — run full comparison
-    receipt_text = _truncate_receipt_text(receipt_text)
-    receipt_data = parse_receipt(receipt_text, ads_fp_entries=ads_data.get('foreign_priority'))
-    print(
-        f"  -> {len(receipt_data['inventors'])} inventor(s), "
-        f"app# {receipt_data['application_number']}",
-        file=sys.stderr
-    )
-    print("", file=sys.stderr)
-
-    rows = compare(ads_data, receipt_data)
-    extra_docs = detect_additional_documents(receipt_text)
-    print(render_markdown(
-        rows,
-        str(ads_path), str(receipt_path),
-        receipt_data['application_number'],
-        receipt_data['filing_date'],
-        receipt_data['confirmation_number'],
-        receipt_data['total_claims'],
-        receipt_data['independent_claims'],
-        additional_docs=extra_docs,
-    ))
-    odp_key = _load_odp_api_key()
-    if odp_key:
-        print(odp_validate_chain(ads_data, receipt_data, odp_key))
+    _emit_comparison(ads_data, receipt_text, ads_path, receipt_path)
 
 
 if __name__ == '__main__':
